@@ -1,0 +1,307 @@
+name: Build APK
+on:
+  workflow_dispatch:
+  push:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.9
+      - name: Generate project
+        run: |
+          set -e
+          mkdir -p pkgsender && cd pkgsender
+          cat > settings.gradle.kts <<'PKGEOF0'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement { repositories { google(); mavenCentral() } }
+          rootProject.name = "PkgSender"
+          include(":app")
+          PKGEOF0
+          cat > build.gradle.kts <<'PKGEOF1'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          PKGEOF1
+          mkdir -p app
+          cat > app/build.gradle.kts <<'PKGEOF2'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+          android {
+              namespace = "com.example.pkgsender"
+              compileSdk = 34
+              defaultConfig {
+                  applicationId = "com.example.pkgsender"
+                  minSdk = 26
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+          }
+          PKGEOF2
+          mkdir -p app/src/main
+          cat > app/src/main/AndroidManifest.xml <<'PKGEOF3'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.INTERNET" />
+              <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+              <application
+                  android:label="PKG Sender"
+                  android:usesCleartextTraffic="true"
+                  android:theme="@android:style/Theme.DeviceDefault.NoActionBar">
+                  <activity android:name=".MainActivity" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          PKGEOF3
+          mkdir -p app/src/main/java/com/example/pkgsender
+          cat > app/src/main/java/com/example/pkgsender/MainActivity.kt <<'PKGEOF4'
+          package com.example.pkgsender
+
+          import android.app.Activity
+          import android.content.Intent
+          import android.net.Uri
+          import android.os.*
+          import android.provider.OpenableColumns
+          import android.text.InputType
+          import android.util.Log
+          import android.text.method.DigitsKeyListener
+          import android.view.View
+          import android.view.WindowManager
+          import android.widget.*
+          import java.io.FileInputStream
+          import java.net.*
+          import java.nio.channels.ServerSocketChannel
+          import java.nio.channels.SocketChannel
+          import java.util.Collections
+          import java.util.concurrent.*
+          import java.util.concurrent.atomic.AtomicLong
+          import kotlin.concurrent.thread
+
+          private const val RPI_PORT = 12800
+
+          class MainActivity : Activity() {
+              private lateinit var ipBox: EditText
+              private lateinit var fileTv: TextView
+              private lateinit var statusTv: TextView
+              private lateinit var bar: ProgressBar
+              private var uri: Uri? = null
+              private var name = ""
+              private var size = 0L
+              private val sent = AtomicLong()
+              @Volatile private var server: ServerSocketChannel? = null
+              private val ui = Handler(Looper.getMainLooper())
+              private var lastB = 0L
+              private var lastT = 0L
+
+              override fun onCreate(b: Bundle?) {
+                  super.onCreate(b)
+                  try { build() } catch (e: Throwable) {
+                      setContentView(TextView(this).apply {
+                          text = Log.getStackTraceString(e); setTextIsSelectable(true); setPadding(32, 96, 32, 32)
+                      })
+                  }
+              }
+
+              private fun bg(f: () -> Unit) = thread { try { f() } catch (e: Throwable) { status("خطأ: $e") } }
+
+              private fun build() {
+                  window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+                  val root = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setPadding(48, 96, 48, 48)
+                      layoutDirection = View.LAYOUT_DIRECTION_RTL
+                  }
+                  ipBox = EditText(this).apply {
+                      hint = "عنوان IP للبلايستيشن"
+                      inputType = InputType.TYPE_CLASS_NUMBER
+                      keyListener = DigitsKeyListener.getInstance("0123456789.")
+                      layoutDirection = View.LAYOUT_DIRECTION_LTR
+                  }
+                  fileTv = TextView(this).apply { text = "ما اخترت ملف"; setPadding(0, 24, 0, 24) }
+                  statusTv = TextView(this).apply { setPadding(0, 24, 0, 24) }
+                  bar = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal)
+                  root.addView(ipBox)
+                  root.addView(btn("اكتشاف تلقائي للبلايستيشن") { discover() })
+                  root.addView(btn("اختيار ملف PKG") { pick() })
+                  root.addView(fileTv)
+                  root.addView(btn("إرسال") { send() })
+                  root.addView(bar)
+                  root.addView(statusTv)
+                  setContentView(root)
+              }
+
+              private fun btn(t: String, f: () -> Unit) = Button(this).apply { text = t; setOnClickListener { f() } }
+              private fun status(s: String) = runOnUiThread { statusTv.text = s }
+
+              // ---------- auto-discovery: scan every local /24 for the installer port ----------
+              private fun discover() {
+                  status("عم دور على البلايستيشن...")
+                  bg {
+                      val found = LinkedBlockingQueue<String>()
+                      val bases = Collections.list(NetworkInterface.getNetworkInterfaces() ?: return@bg status("ما في واجهات شبكة"))
+                          .filter { it.isUp && !it.isLoopback }
+                          .flatMap { it.interfaceAddresses }
+                          .mapNotNull { it.address as? Inet4Address }
+                          .map { it.hostAddress!!.substringBeforeLast('.') }
+                          .distinct()
+                      if (bases.isEmpty()) return@bg status("ما في اتصال شبكة (لا واي فاي ولا إيثرنت). تأكد انو الإيثرنت أخد IP")
+                      status("عم أفحص: " + bases.joinToString { "$it.x" })
+                      val pool = Executors.newFixedThreadPool(64)
+                      for (base in bases) for (i in 1..254) pool.execute {
+                          val ip = "$base.$i"
+                          try { Socket().use { it.connect(InetSocketAddress(ip, RPI_PORT), 400); found.add(ip) } } catch (_: Exception) {}
+                      }
+                      pool.shutdown()
+                      pool.awaitTermination(20, TimeUnit.SECONDS)
+                      val r = found.peek()
+                      runOnUiThread {
+                          if (r != null) { ipBox.setText(r); statusTv.text = "لقيت البلايستيشن: $r" }
+                          else statusTv.text = "ما لقيت شي في ${bases.joinToString { "$it.x" }}. تأكد انو Remote Package Installer شغّال وانو التلفون والبلايستيشن على نفس الشبكة."
+                      }
+                  }
+              }
+
+              // ---------- file picker ----------
+              private fun pick() {
+                  startActivityForResult(Intent(Intent.ACTION_OPEN_DOCUMENT)
+                      .addCategory(Intent.CATEGORY_OPENABLE).setType("*/*"), 1)
+              }
+
+              @Deprecated("fine for a single-activity app")
+              override fun onActivityResult(req: Int, res: Int, data: Intent?) {
+                  super.onActivityResult(req, res, data)
+                  val u = data?.data ?: return
+                  if (req != 1 || res != RESULT_OK) return
+                  contentResolver.query(u, null, null, null, null)?.use { c ->
+                      if (c.moveToFirst()) {
+                          name = c.getString(c.getColumnIndexOrThrow(OpenableColumns.DISPLAY_NAME))
+                          size = c.getLong(c.getColumnIndexOrThrow(OpenableColumns.SIZE))
+                      }
+                  }
+                  uri = u
+                  fileTv.text = "$name  (${size / 1048576} MB)"
+              }
+
+              // ---------- send: start HTTP server on the phone, tell the PS4 to pull from it ----------
+              private fun send() {
+                  val u = uri ?: return status("اختار ملف أول")
+                  val ip = ipBox.text.toString().trim()
+                  if (ip.isEmpty()) return status("اكتب عنوان IP أو استخدم الاكتشاف التلقائي")
+                  bg {
+                      try {
+                          try { Socket().use { it.connect(InetSocketAddress(ip, RPI_PORT), 3000) } }
+                          catch (e: Exception) { return@bg status("ما قدرت أوصل لـ $ip:$RPI_PORT — $e\nتأكد انو Remote Package Installer مفتوح وانو التلفون والبلايستيشن على نفس الشبكة") }
+                          server?.close()
+                          val ss = ServerSocketChannel.open().apply { bind(InetSocketAddress(0)) }
+                          server = ss
+                          sent.set(0)
+                          val port = (ss.localAddress as InetSocketAddress).port
+                          // local address on the interface that routes to the PS4 (Ethernet if that's the link)
+                          val local = DatagramSocket().use {
+                              it.connect(InetAddress.getByName(ip), RPI_PORT); it.localAddress.hostAddress
+                          }
+                          thread(isDaemon = true) {
+                              while (ss.isOpen) try { val ch = ss.accept(); thread { serve(ch, u) } } catch (_: Exception) {}
+                          }
+                          val json = """{"type":"direct","packages":["http://$local:$port/${Uri.encode(name)}"]}"""
+                          val c = URL("http://$ip:$RPI_PORT/api/install").openConnection() as HttpURLConnection
+                          c.requestMethod = "POST"; c.doOutput = true
+                          c.connectTimeout = 4000; c.readTimeout = 15000
+                          c.setRequestProperty("Content-Type", "application/json")
+                          c.outputStream.use { it.write(json.toByteArray()) }
+                          val code = c.responseCode
+                          val body = (if (code < 400) c.inputStream else c.errorStream)?.bufferedReader()?.readText() ?: ""
+                          runOnUiThread {
+                              lastB = 0; lastT = SystemClock.elapsedRealtime()
+                              ui.removeCallbacks(tick); ui.post(tick)
+                              if (code >= 400) statusTv.text = "رد البلايستيشن ($code): $body"
+                          }
+                      } catch (e: Exception) { status("خطأ: $e") }
+                  }
+              }
+
+              private val tick = object : Runnable {
+                  override fun run() {
+                      val now = SystemClock.elapsedRealtime()
+                      val b = sent.get()
+                      val mbs = (b - lastB) / 1048576.0 / ((now - lastT).coerceAtLeast(1) / 1000.0)
+                      lastB = b; lastT = now
+                      bar.progress = if (size > 0) (b * 100 / size).coerceAtMost(100).toInt() else 0
+                      statusTv.text = String.format(java.util.Locale.US, "%.1f MB/s — %d%%", mbs, bar.progress)
+                      if (server?.isOpen == true) ui.postDelayed(this, 500)
+                  }
+              }
+
+              // ---------- minimal HTTP/1.1 file server with Range support + zero-copy sendfile ----------
+              private fun serve(ch: SocketChannel, u: Uri) {
+                  try {
+                      ch.setOption(StandardSocketOptions.SO_SNDBUF, 1 shl 20)
+                      val rd = ch.socket().getInputStream().bufferedReader(Charsets.ISO_8859_1)
+                      val first = rd.readLine() ?: return
+                      var range: String? = null
+                      while (true) {
+                          val l = rd.readLine() ?: break
+                          if (l.isEmpty()) break
+                          if (l.startsWith("Range:", true)) range = l.substring(6).trim()
+                      }
+                      var start = 0L
+                      var end = size - 1
+                      var partial = false
+                      range?.let { r ->
+                          Regex("bytes=(\\d*)-(\\d*)").find(r)?.let { m ->
+                              val a = m.groupValues[1]; val e = m.groupValues[2]
+                              if (a.isNotEmpty()) { start = a.toLong(); if (e.isNotEmpty()) end = minOf(e.toLong(), size - 1) }
+                              else if (e.isNotEmpty()) start = maxOf(0, size - e.toLong())
+                              partial = true
+                          }
+                      }
+                      val len = end - start + 1
+                      val head = "HTTP/1.1 ${if (partial) "206 Partial Content" else "200 OK"}\r\n" +
+                          "Content-Type: application/octet-stream\r\nAccept-Ranges: bytes\r\nContent-Length: $len\r\n" +
+                          (if (partial) "Content-Range: bytes $start-$end/$size\r\n" else "") +
+                          "Connection: close\r\n\r\n"
+                      val out = ch.socket().getOutputStream()
+                      out.write(head.toByteArray()); out.flush()
+                      if (first.startsWith("HEAD")) return
+                      contentResolver.openFileDescriptor(u, "r")?.use { pfd ->
+                          val fc = FileInputStream(pfd.fileDescriptor).channel
+                          var pos = start
+                          var left = len
+                          while (left > 0) {
+                              val n = fc.transferTo(pos, minOf(left, 8L shl 20), ch)
+                              if (n <= 0) break
+                              pos += n; left -= n; sent.addAndGet(n)
+                          }
+                      }
+                  } catch (_: Exception) {
+                  } finally { try { ch.close() } catch (_: Exception) {} }
+              }
+
+              override fun onDestroy() { server?.close(); super.onDestroy() }
+          }
+          PKGEOF4
+      - name: Build
+        working-directory: pkgsender
+        run: gradle assembleDebug --no-daemon
+      - uses: actions/upload-artifact@v4
+        with:
+          name: PkgSender-apk
+          path: pkgsender/app/build/outputs/apk/debug/app-debug.apk
